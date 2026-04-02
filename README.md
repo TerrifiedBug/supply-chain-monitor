@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Automated monitoring of the top **PyPI** and **npm** packages for supply chain compromise. Polls both registries for new releases, diffs each release against its predecessor, and uses an LLM (via [Cursor Agent CLI](https://cursor.com/docs/cli/overview)) to classify diffs as **benign** or **malicious**. Malicious findings trigger a Slack alert.
+Automated monitoring of the top **PyPI** and **npm** packages for supply chain compromise. Polls both registries for new releases, diffs each release against its predecessor, and uses Claude on **AWS Bedrock** (via the [Anthropic Python SDK](https://docs.anthropic.com/en/api/client-sdks)) to classify diffs as **benign** or **malicious**. Malicious findings trigger a Slack alert.
 
 Both ecosystems are monitored by default. Use `--no-pypi` or `--no-npm` to disable one.
 
@@ -39,8 +39,8 @@ Each ecosystem runs its own polling thread but shares the analysis and alerting 
                                    └───────┬───────┘
                                            ▼
                                    ┌───────────────┐  ◄── LLM analysis
-                                   │ Cursor Agent  │      (read-only)
-                                   │ CLI (ask mode)│
+                                   │ Claude on AWS │      (tool_use)
+                                   │   Bedrock     │
                                    └───────┬───────┘
                                            │
                                        verdict?
@@ -66,27 +66,23 @@ The LLM analysis is prompted to look for:
 
 ## Prerequisites
 
-- **Python 3.9+** — install runtime dependencies with `pip install -r requirements.txt` (stdlib covers most of the tool; `requests` is used for Slack uploads)
-- **Cursor Agent CLI** — the standalone `agent` binary, not the IDE
+- **Python 3.9+** — install runtime dependencies with `pip install -r requirements.txt`
+- **AWS Bedrock access** — an AWS account with Claude model access enabled in Bedrock
 
-### Installing Cursor Agent CLI
+### AWS Bedrock Configuration
 
-**Windows (PowerShell):**
-```powershell
-irm 'https://cursor.com/install?win32=true' | iex
-```
+Set the following environment variables:
 
-**macOS / Linux:**
 ```bash
-curl https://cursor.com/install -fsS | bash
+export CLAUDE_CODE_USE_BEDROCK=1
+export AWS_REGION=us-east-1
+export ANTHROPIC_MODEL='global.anthropic.claude-opus-4-6-v1'
+export AWS_BEARER_TOKEN_BEDROCK=<your-token>
 ```
 
-Verify with:
-```bash
-agent --version
-```
+The Anthropic SDK supports the standard AWS credential chain (env vars, `~/.aws/credentials`, IAM instance profile, ECS task role). The `AWS_BEARER_TOKEN_BEDROCK` is the simplest option for local development.
 
-You must be authenticated with Cursor (`agent login` or set `CURSOR_API_KEY`).
+Your IAM principal needs `bedrock:InvokeModel` permission on the target model ARN.
 
 ### Slack Configuration
 
@@ -128,7 +124,7 @@ python monitor.py --no-npm
 | `monitor.py` | **Main orchestrator** — poll PyPI + npm, diff, analyze, alert (parallel threads) |
 | `pypi_monitor.py` | Standalone PyPI changelog poller (used for exploration) |
 | `package_diff.py` | Download and diff two versions of any PyPI or npm package |
-| `analyze_diff.py` | Send a diff to Cursor Agent CLI, parse verdict |
+| `analyze_diff.py` | Send a diff to Claude on Bedrock, get structured verdict via tool_use |
 | `top_pypi_packages.py` | Fetch and list top N PyPI packages by download count |
 | `slack.py` | Slack API client (SendMessage, PostFile) |
 | `etc/slack.json` | Slack bot credentials |
@@ -147,7 +143,8 @@ Options:
   --interval SECS  Poll interval in seconds (default: 300)
   --once           Single pass over recent events, then exit
   --slack          Enable Slack alerts for malicious findings
-  --model MODEL    Override LLM model (default: composer-2-fast)
+  --model MODEL    Bedrock model ID (default: ANTHROPIC_MODEL env or global.anthropic.claude-opus-4-6-v1)
+  --aws-region R   AWS region for Bedrock (default: AWS_REGION env or us-east-1)
   --debug          Enable DEBUG logging (includes agent raw output)
 
 PyPI options:
@@ -210,10 +207,10 @@ python analyze_diff.py telnyx_diff.md
 python analyze_diff.py telnyx_diff.md --json
 
 # Use a specific model
-python analyze_diff.py telnyx_diff.md --model claude-4-opus
+python analyze_diff.py telnyx_diff.md --model global.anthropic.claude-sonnet-4-6
 ```
 
-Runs Cursor Agent CLI in `--mode ask` (read-only) with `--trust`. The agent reads the diff file and returns a structured verdict.
+Calls Claude on Bedrock via the Anthropic SDK with forced `tool_use` for structured output. Returns a verdict with confidence score, severity rating, and specific indicators found.
 
 Exit codes: `0` = benign, `1` = malicious, `2` = unknown/error.
 
@@ -290,11 +287,48 @@ The new bin/ssl_hotfix.js contains obfuscated code that downloads
 and executes a remote payload on postinstall...
 ```
 
+## Container Deployment
+
+The monitor is designed to run in a hardened Docker container. This is the recommended deployment for production since the tool downloads and extracts potentially malicious packages.
+
+```bash
+# Build
+docker build -t supply-chain-monitor .
+
+# Run with Bedrock env vars
+docker run -d \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --tmpfs /tmp/scm:size=512m,noexec,nosuid,nodev \
+  -v scm-state:/app/state \
+  -v scm-logs:/app/logs \
+  -v ./etc:/app/config/etc:ro \
+  -e CLAUDE_CODE_USE_BEDROCK=1 \
+  -e AWS_REGION=us-east-1 \
+  -e ANTHROPIC_MODEL=global.anthropic.claude-opus-4-6-v1 \
+  -e AWS_BEARER_TOKEN_BEDROCK="$AWS_BEARER_TOKEN_BEDROCK" \
+  supply-chain-monitor
+
+# Or use docker compose for local development
+docker compose up --build
+```
+
+**Security hardening:**
+
+| Layer | Protection |
+|-------|-----------|
+| Read-only root filesystem | Container image is immutable at runtime |
+| `--cap-drop ALL` | No Linux capabilities (process only makes outbound HTTPS) |
+| `no-new-privileges` | No privilege escalation via setuid/setgid |
+| tmpfs `/tmp/scm` with `noexec` | Extracted files cannot execute; RAM-only, capped at 512MB |
+| Non-root user (UID 10001) | No root access inside container |
+| Volume mounts | State and logs persist; config is read-only |
+
 ## Limitations
 
 - Releases are analyzed sequentially within each ecosystem thread. During high release volume, there will be a processing backlog.
-- **Cursor Agent CLI required** — analysis depends on an active Cursor subscription and the `agent` CLI being authenticated.
-- **Sandbox mode** (filesystem isolation) is only available on macOS/Linux. On Windows, the agent runs in read-only `ask` mode but without OS-level sandboxing.
+- **AWS Bedrock access required** — analysis depends on Claude model access in Bedrock and valid AWS credentials.
 - **Watchlists are static** — loaded once at startup from the hugovk (PyPI) and download-counts (npm) datasets. Restart to refresh.
 - **npm _changes gap protection** — if the saved npm sequence falls more than 10,000 changes behind the registry head, the monitor resets to head to avoid a long catch-up. Releases during the gap are missed.
 

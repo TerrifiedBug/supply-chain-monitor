@@ -1,0 +1,142 @@
+# =============================================================================
+# docker-compose.yml -- Local development for Supply Chain Monitor
+#
+# Usage:
+#   docker compose up --build                    # full daemon (PyPI + npm)
+#   docker compose run --rm monitor --once       # one-shot scan
+#   docker compose run --rm monitor --no-npm     # PyPI only
+#
+# Prerequisites:
+#   - Place your etc/slack.json in ./etc/slack.json (or disable Slack)
+#   - For Bedrock: export AWS_* env vars or use aws-vault / credential files
+# =============================================================================
+
+services:
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # Override default CMD for local dev: shorter interval, debug logging
+    command: ["--slack", "--interval", "120", "--debug"]
+
+    # -----------------------------------------------------------------------
+    # Security hardening
+    # -----------------------------------------------------------------------
+    # Read-only root filesystem: the container's filesystem is immutable.
+    # Only explicitly mounted volumes are writable.
+    read_only: true
+
+    # Drop ALL Linux capabilities. This process needs zero caps --
+    # it only makes outbound HTTPS connections and writes to mounted volumes.
+    cap_drop:
+      - ALL
+
+    # Prevent gaining new privileges via setuid/setgid binaries
+    security_opt:
+      - no-new-privileges:true
+
+    # -----------------------------------------------------------------------
+    # Temp directory: tmpfs mount for package extraction
+    # -----------------------------------------------------------------------
+    # This is the critical security boundary. All downloaded and extracted
+    # package contents land here. Properties:
+    #   - tmpfs: lives in memory only, never hits disk (no persistence)
+    #   - size=512m: hard cap prevents a malicious archive from filling disk
+    #   - noexec: extracted files cannot be executed even if marked +x
+    #   - nosuid: no setuid escalation from extracted binaries
+    #   - nodev: no device file creation from extracted archives
+    tmpfs:
+      - /tmp/scm:size=512m,noexec,nosuid,nodev,uid=10001,gid=10001
+
+    # -----------------------------------------------------------------------
+    # Persistent volumes
+    # -----------------------------------------------------------------------
+    volumes:
+      # State file: persists polling position across container restarts
+      - scm-state:/app/state
+
+      # Logs: persisted for post-mortem analysis
+      - scm-logs:/app/logs
+
+      # Slack config: bind-mount from host
+      # Create ./etc/slack.json locally with your bot token and channel
+      - ./etc:/app/config/etc:ro
+
+    # -----------------------------------------------------------------------
+    # Environment
+    # -----------------------------------------------------------------------
+    environment:
+      # Force all Python tempfile operations into our sandboxed tmpfs
+      - TMPDIR=/tmp/scm
+
+      # Bedrock configuration.
+      # In production, use IAM task roles instead of env vars.
+      - CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK:-1}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - AWS_BEARER_TOKEN_BEDROCK=${AWS_BEARER_TOKEN_BEDROCK:-}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-global.anthropic.claude-opus-4-6-v1}
+      - ANTHROPIC_DEFAULT_HAIKU_MODEL=${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}
+      - CLAUDE_CODE_MAX_OUTPUT_TOKENS=${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-64000}
+      # Fallback auth (if not using bearer token)
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+
+      # Python runtime tuning
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+
+    # -----------------------------------------------------------------------
+    # Resource limits
+    # -----------------------------------------------------------------------
+    # Prevent runaway memory usage from decompression bombs or accumulation.
+    # The monitor itself is lightweight; 1GB covers tmpfs + Python overhead.
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+        reservations:
+          memory: 256m
+          cpus: "0.25"
+
+    # -----------------------------------------------------------------------
+    # Networking
+    # -----------------------------------------------------------------------
+    # Outbound only. No ports exposed -- the monitor initiates all connections.
+    # Required outbound destinations:
+    #   - pypi.org (HTTPS 443)            -- PyPI API + package downloads
+    #   - registry.npmjs.org (HTTPS 443)  -- npm API + package downloads
+    #   - replicate.npmjs.com (HTTPS 443) -- npm CouchDB changes feed
+    #   - hugovk.github.io (HTTPS 443)    -- top packages dataset
+    #   - bedrock-runtime.*.amazonaws.com (HTTPS 443) -- Bedrock LLM API
+    #   - slack.com (HTTPS 443)           -- Slack alerts
+    networks:
+      - scm-net
+
+    # -----------------------------------------------------------------------
+    # Restart policy
+    # -----------------------------------------------------------------------
+    restart: unless-stopped
+
+    # -----------------------------------------------------------------------
+    # Logging
+    # -----------------------------------------------------------------------
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Named volumes for persistence
+volumes:
+  scm-state:
+    driver: local
+  scm-logs:
+    driver: local
+
+# Isolated network
+networks:
+  scm-net:
+    driver: bridge

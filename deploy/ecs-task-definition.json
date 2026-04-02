@@ -1,0 +1,115 @@
+{
+  "_comment": [
+    "ECS Fargate task definition for Supply Chain Monitor.",
+    "Replace placeholders marked with <PLACEHOLDER> before use.",
+    "This is a reference template -- deploy via Terraform or CloudFormation in production."
+  ],
+  "family": "supply-chain-monitor",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/scm-ecs-execution-role",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/scm-ecs-task-role",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "containerDefinitions": [
+    {
+      "name": "supply-chain-monitor",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/supply-chain-monitor:latest",
+      "essential": true,
+      "command": ["--slack", "--interval", "300"],
+      "readonlyRootFilesystem": true,
+      "user": "10001:10001",
+      "linuxParameters": {
+        "initProcessEnabled": true,
+        "capabilities": {
+          "drop": ["ALL"]
+        },
+        "tmpfs": [
+          {
+            "containerPath": "/tmp/scm",
+            "size": 512,
+            "mountOptions": ["noexec", "nosuid", "nodev"]
+          }
+        ]
+      },
+      "environment": [
+        { "name": "TMPDIR",    "value": "/tmp/scm" },
+        { "name": "AWS_REGION", "value": "<REGION>" },
+        { "name": "PYTHONUNBUFFERED", "value": "1" }
+      ],
+      "secrets": [
+        {
+          "_comment": "Slack config JSON from AWS Secrets Manager",
+          "name": "SLACK_CONFIG_JSON",
+          "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:scm/slack-config"
+        }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "scm-state",
+          "containerPath": "/app/state",
+          "readOnly": false
+        },
+        {
+          "sourceVolume": "scm-logs",
+          "containerPath": "/app/logs",
+          "readOnly": false
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/supply-chain-monitor",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "scm",
+          "awslogs-create-group": "true"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "python -c \"import os,time,sys; f='/app/state/last_serial.yaml'; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f)<900 else 1)\""
+        ],
+        "interval": 60,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 120
+      }
+    }
+  ],
+  "volumes": [
+    {
+      "name": "scm-state",
+      "efsVolumeConfiguration": {
+        "_comment": "EFS for state persistence across task restarts. Create EFS filesystem + access point first.",
+        "fileSystemId": "<EFS_FILESYSTEM_ID>",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "<EFS_ACCESS_POINT_ID>",
+          "iam": "ENABLED"
+        }
+      }
+    },
+    {
+      "name": "scm-logs",
+      "efsVolumeConfiguration": {
+        "fileSystemId": "<EFS_FILESYSTEM_ID>",
+        "rootDirectory": "/scm-logs",
+        "transitEncryption": "ENABLED",
+        "authorizationConfig": {
+          "accessPointId": "<EFS_LOGS_ACCESS_POINT_ID>",
+          "iam": "ENABLED"
+        }
+      }
+    }
+  ],
+  "tags": [
+    { "key": "Project",     "value": "supply-chain-monitor" },
+    { "key": "Team",        "value": "s1-dfir" },
+    { "key": "Environment", "value": "production" }
+  ]
+}

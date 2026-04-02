@@ -1,0 +1,77 @@
+{
+  "_comment": "IAM policy documents for ECS Fargate deployment. Create two roles: execution role and task role.",
+
+  "execution_role_policy": {
+    "_comment": "Attached to the ECS execution role. Allows ECS agent to pull images and write logs.",
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "ECRPull",
+        "Effect": "Allow",
+        "Action": [
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:GetAuthorizationToken"
+        ],
+        "Resource": "*"
+      },
+      {
+        "Sid": "CloudWatchLogs",
+        "Effect": "Allow",
+        "Action": [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ],
+        "Resource": "arn:aws:logs:*:*:log-group:/ecs/supply-chain-monitor:*"
+      },
+      {
+        "Sid": "SecretsAccess",
+        "Effect": "Allow",
+        "Action": [
+          "secretsmanager:GetSecretValue"
+        ],
+        "Resource": "arn:aws:secretsmanager:*:*:secret:scm/*"
+      }
+    ]
+  },
+
+  "task_role_policy": {
+    "_comment": [
+      "Attached to the ECS task role. This is what the running container can access.",
+      "Bedrock InvokeModel is the only AWS API the application needs.",
+      "Restrict to specific model ARNs to prevent misuse."
+    ],
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "BedrockInvoke",
+        "Effect": "Allow",
+        "Action": [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream"
+        ],
+        "Resource": [
+          "arn:aws:bedrock:*::foundation-model/anthropic.claude-*"
+        ]
+      },
+      {
+        "Sid": "EFSAccess",
+        "Effect": "Allow",
+        "Action": [
+          "elasticfilesystem:ClientMount",
+          "elasticfilesystem:ClientWrite"
+        ],
+        "Resource": "arn:aws:elasticfilesystem:*:*:file-system/<EFS_FILESYSTEM_ID>",
+        "Condition": {
+          "StringEquals": {
+            "elasticfilesystem:AccessPointArn": [
+              "arn:aws:elasticfilesystem:*:*:access-point/<EFS_ACCESS_POINT_ID>",
+              "arn:aws:elasticfilesystem:*:*:access-point/<EFS_LOGS_ACCESS_POINT_ID>"
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

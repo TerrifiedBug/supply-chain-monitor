@@ -1,0 +1,61 @@
+# Version control
+.git
+.github
+.buildkite
+.gitignore
+
+# Python artifacts
+__pycache__
+*.py[cod]
+*$py.class
+*.egg-info
+*.egg
+dist/
+build/
+*.whl
+.venv/
+venv/
+env/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime state (should not be baked into the image)
+last_serial.yaml
+logs/
+
+# Secrets (NEVER include in image)
+etc/
+slack.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation (not needed in image)
+*.md
+LICENSE
+NOTICE.txt
+CODEOWNERS
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
+SECURITY.md
+
+# Dev dependencies
+requirements-dev.txt
+renovate.json
+catalog-info.yaml
+
+# Docker artifacts
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Temp / analysis artifacts
+analysis/
+pkg_diff_tmp/

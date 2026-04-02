@@ -5,8 +5,8 @@
 Supply chain monitor for top PyPI and npm packages.
 
 Polls PyPI and npm for new releases of the top N packages, diffs each new
-release against its previous version, analyzes the diff with Cursor Agent
-for signs of compromise, and alerts Slack if anything malicious is found.
+release against its previous version, analyzes the diff with Claude on AWS
+Bedrock for signs of compromise, and alerts Slack if anything malicious is found.
 
 Both ecosystems are monitored by default. Use --no-pypi or --no-npm to
 disable one.
@@ -35,10 +35,11 @@ import traceback
 import urllib.parse
 import urllib.request
 import xmlrpc.client
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
-from analyze_diff import parse_verdict, run_cursor_agent
+from analyze_diff import analyze_diff
 from package_diff import (
     collect_files,
     download_npm_package,
@@ -75,6 +76,7 @@ NPM_REPLICATE = "https://replicate.npmjs.com"
 NPM_REGISTRY = "https://registry.npmjs.org"
 NPM_SEARCH = "https://registry.npmjs.org/-/v1/search"
 NPM_MAX_CHANGES_PER_CYCLE = 10000
+DEFAULT_WORKERS = 4
 
 _state_lock = threading.Lock()
 
@@ -247,23 +249,17 @@ def analyze_report(
     new_version: str,
     *,
     model: str | None = None,
+    aws_region: str | None = None,
 ) -> tuple[str, str]:
-    """Write report to a temp workspace, run Cursor Agent, return (verdict, analysis)."""
-    safe_name = package.replace("/", "_").replace("@", "")
-    workspace = Path(tempfile.mkdtemp(prefix=f"scm_analyze_{safe_name}_"))
-    diff_file = workspace / f"{safe_name}_diff.md"
-    diff_file.write_text(report, encoding="utf-8")
-    log.info("Diff written to %s", diff_file)
+    """Analyze a diff report via Claude on Bedrock, return (verdict, analysis)."""
     try:
-        raw_output = run_cursor_agent(diff_file, model=model or "composer-2-fast")
-        verdict, analysis = parse_verdict(raw_output)
+        verdict, analysis = analyze_diff(
+            report, model=model, aws_region=aws_region,
+        )
     except Exception:
         log.error("Analysis failed for %s %s:\n%s", package, new_version, traceback.format_exc())
-        log.error("Diff preserved at %s", diff_file)
         return "error", traceback.format_exc()
-    else:
-        shutil.rmtree(workspace, ignore_errors=True)
-        return verdict, analysis
+    return verdict, analysis
 
 
 def send_slack_alert(
@@ -516,6 +512,7 @@ def process_npm_release(
     slack: bool = False,
     *,
     model: str | None = None,
+    aws_region: str | None = None,
 ) -> str:
     """Full pipeline for one npm release: diff -> analyze -> alert. Returns verdict."""
     log.info("[npm] Processing %s %s (rank #%s)...", package, new_version, f"{rank:,}")
@@ -532,7 +529,9 @@ def process_npm_release(
 
     try:
         log.info("[npm] Analyzing diff for %s...", package)
-        verdict, analysis = analyze_report(report, package, new_version, model=model)
+        verdict, analysis = analyze_report(
+            report, package, new_version, model=model, aws_region=aws_region,
+        )
         log.info("[npm] Verdict for %s %s: %s", package, new_version, verdict.upper())
 
         if verdict == "malicious":
@@ -545,6 +544,83 @@ def process_npm_release(
     finally:
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Parallel release processing
+# ---------------------------------------------------------------------------
+
+def _process_releases_parallel(
+    releases: list[tuple[str, str, int]],
+    process_fn,
+    *,
+    workers: int = DEFAULT_WORKERS,
+    slack: bool = False,
+    model: str | None = None,
+    aws_region: str | None = None,
+    eco_label: str = "pypi",
+    stats: dict[str, int] | None = None,
+) -> None:
+    """Process releases concurrently, prioritized by package rank.
+
+    Sorts by rank ascending (lower rank = higher profile = analyzed first),
+    then submits to a thread pool.  Each worker runs the full pipeline:
+    download → diff → LLM analysis → alert.
+    """
+    if not releases:
+        return
+
+    # Priority queue: highest-profile packages first
+    releases.sort(key=lambda r: r[2])
+
+    log.info(
+        "[%s] Processing %d releases with %d workers (ranks %s … %s)",
+        eco_label, len(releases), workers,
+        f"#{releases[0][2]:,}", f"#{releases[-1][2]:,}",
+    )
+
+    if workers <= 1:
+        for package, version, rank in releases:
+            verdict = process_fn(
+                package, version, rank, slack=slack,
+                model=model, aws_region=aws_region,
+            )
+            if stats is not None:
+                stats["checked"] += 1
+                stats[verdict] = stats.get(verdict, 0) + 1
+                log.info("[%s] Stats: %s", eco_label, stats)
+        return
+
+    stats_lock = threading.Lock()
+
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix=f"{eco_label}-worker",
+    ) as pool:
+        futures = {}
+        for package, version, rank in releases:
+            future = pool.submit(
+                process_fn,
+                package, version, rank, slack=slack,
+                model=model, aws_region=aws_region,
+            )
+            futures[future] = (package, version, rank)
+
+        for future in as_completed(futures):
+            package, version, rank = futures[future]
+            try:
+                verdict = future.result()
+            except Exception:
+                log.error(
+                    "[%s] Unhandled error processing %s %s:\n%s",
+                    eco_label, package, version, traceback.format_exc(),
+                )
+                verdict = "error"
+
+            if stats is not None:
+                with stats_lock:
+                    stats["checked"] += 1
+                    stats[verdict] = stats.get(verdict, 0) + 1
+                    log.info("[%s] Stats: %s", eco_label, stats)
 
 
 # ---------------------------------------------------------------------------
@@ -574,6 +650,7 @@ def process_release(
     slack: bool = False,
     *,
     model: str | None = None,
+    aws_region: str | None = None,
 ) -> str:
     """Full pipeline for one release: diff -> analyze -> alert. Returns verdict."""
     log.info("[pypi] Processing %s %s (rank #%s)...", package, new_version, f"{rank:,}")
@@ -590,7 +667,9 @@ def process_release(
 
     try:
         log.info("[pypi] Analyzing diff for %s...", package)
-        verdict, analysis = analyze_report(report, package, new_version, model=model)
+        verdict, analysis = analyze_report(
+            report, package, new_version, model=model, aws_region=aws_region,
+        )
         log.info("[pypi] Verdict for %s %s: %s", package, new_version, verdict.upper())
 
         if verdict == "malicious":
@@ -610,6 +689,8 @@ def poll_loop(
     initial_serial: int | None = None,
     state_path: Path | None = None,
     model: str | None = None,
+    aws_region: str | None = None,
+    workers: int = DEFAULT_WORKERS,
 ):
     state_path = state_path or LAST_SERIAL_PATH
     client = xmlrpc.client.ServerProxy(PYPI_XMLRPC)
@@ -660,14 +741,16 @@ def poll_loop(
                     len(releases), f"{serial:,}", f"{new_serial:,}",
                 )
 
-            for package, version, ts in releases:
-                rank = watchlist.get(package.lower(), 0)
-                verdict = process_release(
-                    package, version, rank, slack=slack, model=model,
-                )
-                stats["checked"] += 1
-                stats[verdict] = stats.get(verdict, 0) + 1
-                log.info("[pypi] Stats: %s", stats)
+            ranked = [
+                (pkg, ver, watchlist.get(pkg.lower(), 0))
+                for pkg, ver, _ts in releases
+            ]
+            _process_releases_parallel(
+                ranked, process_release,
+                workers=workers, slack=slack,
+                model=model, aws_region=aws_region,
+                eco_label="pypi", stats=stats,
+            )
 
             serial = new_serial
             save_last_serial(serial, state_path)
@@ -684,6 +767,8 @@ def run_once(
     *,
     since_serial: int | None = None,
     model: str | None = None,
+    aws_region: str | None = None,
+    workers: int = DEFAULT_WORKERS,
 ):
     client = xmlrpc.client.ServerProxy(PYPI_XMLRPC)
     current_serial = client.changelog_last_serial()
@@ -706,9 +791,16 @@ def run_once(
     releases = extract_new_releases(events, watchlist)
     log.info("[pypi] %s new watchlist releases in window", len(releases))
 
-    for package, version, ts in releases:
-        rank = watchlist.get(package.lower(), 0)
-        process_release(package, version, rank, slack=slack, model=model)
+    ranked = [
+        (pkg, ver, watchlist.get(pkg.lower(), 0))
+        for pkg, ver, _ts in releases
+    ]
+    _process_releases_parallel(
+        ranked, process_release,
+        workers=workers, slack=slack,
+        model=model, aws_region=aws_region,
+        eco_label="pypi",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -723,6 +815,8 @@ def npm_poll_loop(
     initial_seq: int | None = None,
     state_path: Path | None = None,
     model: str | None = None,
+    aws_region: str | None = None,
+    workers: int = DEFAULT_WORKERS,
 ):
     state_path = state_path or LAST_SERIAL_PATH
 
@@ -798,14 +892,16 @@ def npm_poll_loop(
                     len(releases), f"{seq:,}",
                 )
 
-            for pkg, version in releases:
-                rank = watchlist.get(pkg.lower(), 0)
-                verdict = process_npm_release(
-                    pkg, version, rank, slack=slack, model=model,
-                )
-                stats["checked"] += 1
-                stats[verdict] = stats.get(verdict, 0) + 1
-                log.info("[npm] Stats: %s", stats)
+            ranked = [
+                (pkg, ver, watchlist.get(pkg.lower(), 0))
+                for pkg, ver in releases
+            ]
+            _process_releases_parallel(
+                ranked, process_npm_release,
+                workers=workers, slack=slack,
+                model=model, aws_region=aws_region,
+                eco_label="npm", stats=stats,
+            )
 
             poll_epoch = cycle_start
             save_npm_state(seq, poll_epoch, state_path)
@@ -821,6 +917,8 @@ def npm_run_once(
     lookback_seconds: int = 600,
     *,
     model: str | None = None,
+    aws_region: str | None = None,
+    workers: int = DEFAULT_WORKERS,
 ):
     """One-shot: check for npm releases published in the last *lookback_seconds*."""
     cutoff_epoch = time.time() - lookback_seconds
@@ -856,9 +954,16 @@ def npm_run_once(
 
     log.info("[npm] %d new watchlist releases to process", len(releases))
 
-    for pkg, version in releases:
-        rank = watchlist.get(pkg.lower(), 0)
-        process_npm_release(pkg, version, rank, slack=slack, model=model)
+    ranked = [
+        (pkg, ver, watchlist.get(pkg.lower(), 0))
+        for pkg, ver in releases
+    ]
+    _process_releases_parallel(
+        ranked, process_npm_release,
+        workers=workers, slack=slack,
+        model=model, aws_region=aws_region,
+        eco_label="npm",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -871,8 +976,11 @@ def main():
     parser.add_argument("--interval", type=int, default=300, help="Poll interval in seconds (default: 300)")
     parser.add_argument("--once", action="store_true", help="Single pass over recent events, then exit")
     parser.add_argument("--slack", action="store_true", help="Enable Slack alerts for malicious findings")
-    parser.add_argument("--model", help="Override model for Cursor Agent analysis")
-    parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging (includes agent raw output)")
+    parser.add_argument("--model", help="Bedrock model ID (default: ANTHROPIC_MODEL env or global.anthropic.claude-opus-4-6-v1)")
+    parser.add_argument("--aws-region", help="AWS region for Bedrock (default: AWS_REGION env or us-east-1)")
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                        help=f"Concurrent analysis workers per ecosystem (default: {DEFAULT_WORKERS})")
+    parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging (includes Bedrock response details)")
 
     pypi_group = parser.add_argument_group("PyPI options")
     pypi_group.add_argument("--no-pypi", action="store_true", help="Disable PyPI monitoring")
@@ -905,11 +1013,17 @@ def main():
                 slack=args.slack,
                 since_serial=args.serial,
                 model=args.model,
+                aws_region=args.aws_region,
+                workers=args.workers,
             )
         if enable_npm:
             npm_top = args.npm_top or args.top
             npm_watchlist = load_npm_watchlist(npm_top)
-            npm_run_once(npm_watchlist, slack=args.slack, model=args.model)
+            npm_run_once(
+                npm_watchlist, slack=args.slack,
+                model=args.model, aws_region=args.aws_region,
+                workers=args.workers,
+            )
     else:
         threads: list[threading.Thread] = []
 
@@ -922,6 +1036,8 @@ def main():
                     "slack": args.slack,
                     "initial_serial": args.serial,
                     "model": args.model,
+                    "aws_region": args.aws_region,
+                    "workers": args.workers,
                 },
                 daemon=True,
                 name="pypi-poll",
@@ -938,6 +1054,8 @@ def main():
                     "slack": args.slack,
                     "initial_seq": args.npm_seq,
                     "model": args.model,
+                    "aws_region": args.aws_region,
+                    "workers": args.workers,
                 },
                 daemon=True,
                 name="npm-poll",

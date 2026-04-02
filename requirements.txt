@@ -1,1 +1,2 @@
+anthropic[bedrock]>=0.49.0
 requests==2.33.1
