@@ -15,7 +15,12 @@ logger = logging.getLogger(__name__)
 
 PATH = os.path.dirname(os.path.abspath(__file__))
 slack_config_path = os.path.join(PATH, "etc", "slack.json")
-if os.path.exists(slack_config_path):
+
+# Support SLACK_CONFIG_JSON env var (for ECS/Secrets Manager) or file on disk.
+_env_json = os.environ.get("SLACK_CONFIG_JSON")
+if _env_json:
+    slack_config = json.loads(_env_json)
+elif os.path.exists(slack_config_path):
     with open(slack_config_path, "rb") as f:
         slack_config = json.load(f)
 else:
