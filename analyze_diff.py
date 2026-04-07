@@ -32,7 +32,7 @@ from anthropic import AnthropicBedrock
 log = logging.getLogger("monitor.analyze")
 
 DEFAULT_MODEL = os.environ.get(
-    "ANTHROPIC_MODEL", "anthropic.claude-sonnet-4-20250514-v1:0"
+    "ANTHROPIC_MODEL", "global.anthropic.claude-sonnet-4-6-v1"
 )
 DEFAULT_AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 

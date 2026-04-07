@@ -1032,7 +1032,7 @@ def main():
     parser.add_argument("--interval", type=int, default=300, help="Poll interval in seconds (default: 300)")
     parser.add_argument("--once", action="store_true", help="Single pass over recent events, then exit")
     parser.add_argument("--slack", action="store_true", help="Enable Slack alerts for malicious findings")
-    parser.add_argument("--model", help="Bedrock model ID (default: ANTHROPIC_MODEL env or anthropic.claude-sonnet-4-20250514-v1:0)")
+    parser.add_argument("--model", help="Bedrock model ID (default: ANTHROPIC_MODEL env or global.anthropic.claude-sonnet-4-6-v1)")
     parser.add_argument("--aws-region", help="AWS region for Bedrock (default: AWS_REGION env or us-east-1)")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help=f"Concurrent analysis workers per ecosystem (default: {DEFAULT_WORKERS})")

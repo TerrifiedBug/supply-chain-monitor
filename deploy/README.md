@@ -296,7 +296,7 @@ All configuration is via environment variables or CLI arguments. Set env vars in
 | Env Var | CLI Flag | Default | Description |
 |---------|----------|---------|-------------|
 | `AWS_REGION` | `--aws-region` | `us-east-1` | AWS region for Bedrock |
-| `ANTHROPIC_MODEL` | `--model` | `anthropic.claude-sonnet-4-20250514-v1:0` | Bedrock model ID |
+| `ANTHROPIC_MODEL` | `--model` | `global.anthropic.claude-sonnet-4-6-v1` | Bedrock model ID |
 | `SCM_MAX_DIFF_TOKENS` | `--max-diff-tokens` | `900000` | Max input tokens for diff truncation |
 | `SLACK_CONFIG_JSON` | N/A | N/A | JSON string with Slack creds (see step 3) |
 | — | `--top` | `15000` | Top N packages to watch per ecosystem |
