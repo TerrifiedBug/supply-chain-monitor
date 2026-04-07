@@ -250,11 +250,13 @@ def analyze_report(
     *,
     model: str | None = None,
     aws_region: str | None = None,
+    max_diff_tokens: int | None = None,
 ) -> tuple[str, str]:
     """Analyze a diff report via Claude on Bedrock, return (verdict, analysis)."""
     try:
         verdict, analysis = analyze_diff(
             report, model=model, aws_region=aws_region,
+            max_diff_tokens=max_diff_tokens,
         )
     except Exception:
         log.error("Analysis failed for %s %s:\n%s", package, new_version, traceback.format_exc())
@@ -513,6 +515,7 @@ def process_npm_release(
     *,
     model: str | None = None,
     aws_region: str | None = None,
+    max_diff_tokens: int | None = None,
 ) -> str:
     """Full pipeline for one npm release: diff -> analyze -> alert. Returns verdict."""
     log.info("[npm] Processing %s %s (rank #%s)...", package, new_version, f"{rank:,}")
@@ -531,6 +534,7 @@ def process_npm_release(
         log.info("[npm] Analyzing diff for %s...", package)
         verdict, analysis = analyze_report(
             report, package, new_version, model=model, aws_region=aws_region,
+            max_diff_tokens=max_diff_tokens,
         )
         log.info("[npm] Verdict for %s %s: %s", package, new_version, verdict.upper())
 
@@ -558,6 +562,7 @@ def _process_releases_parallel(
     slack: bool = False,
     model: str | None = None,
     aws_region: str | None = None,
+    max_diff_tokens: int | None = None,
     eco_label: str = "pypi",
     stats: dict[str, int] | None = None,
 ) -> None:
@@ -584,6 +589,7 @@ def _process_releases_parallel(
             verdict = process_fn(
                 package, version, rank, slack=slack,
                 model=model, aws_region=aws_region,
+                max_diff_tokens=max_diff_tokens,
             )
             if stats is not None:
                 stats["checked"] += 1
@@ -602,6 +608,7 @@ def _process_releases_parallel(
                 process_fn,
                 package, version, rank, slack=slack,
                 model=model, aws_region=aws_region,
+                max_diff_tokens=max_diff_tokens,
             )
             futures[future] = (package, version, rank)
 
@@ -651,6 +658,7 @@ def process_release(
     *,
     model: str | None = None,
     aws_region: str | None = None,
+    max_diff_tokens: int | None = None,
 ) -> str:
     """Full pipeline for one release: diff -> analyze -> alert. Returns verdict."""
     log.info("[pypi] Processing %s %s (rank #%s)...", package, new_version, f"{rank:,}")
@@ -669,6 +677,7 @@ def process_release(
         log.info("[pypi] Analyzing diff for %s...", package)
         verdict, analysis = analyze_report(
             report, package, new_version, model=model, aws_region=aws_region,
+            max_diff_tokens=max_diff_tokens,
         )
         log.info("[pypi] Verdict for %s %s: %s", package, new_version, verdict.upper())
 
@@ -690,6 +699,7 @@ def poll_loop(
     state_path: Path | None = None,
     model: str | None = None,
     aws_region: str | None = None,
+    max_diff_tokens: int | None = None,
     workers: int = DEFAULT_WORKERS,
 ):
     state_path = state_path or LAST_SERIAL_PATH
@@ -749,6 +759,7 @@ def poll_loop(
                 ranked, process_release,
                 workers=workers, slack=slack,
                 model=model, aws_region=aws_region,
+                max_diff_tokens=max_diff_tokens,
                 eco_label="pypi", stats=stats,
             )
 
@@ -768,6 +779,7 @@ def run_once(
     since_serial: int | None = None,
     model: str | None = None,
     aws_region: str | None = None,
+    max_diff_tokens: int | None = None,
     workers: int = DEFAULT_WORKERS,
 ):
     client = xmlrpc.client.ServerProxy(PYPI_XMLRPC)
@@ -799,6 +811,7 @@ def run_once(
         ranked, process_release,
         workers=workers, slack=slack,
         model=model, aws_region=aws_region,
+        max_diff_tokens=max_diff_tokens,
         eco_label="pypi",
     )
 
@@ -816,6 +829,7 @@ def npm_poll_loop(
     state_path: Path | None = None,
     model: str | None = None,
     aws_region: str | None = None,
+    max_diff_tokens: int | None = None,
     workers: int = DEFAULT_WORKERS,
 ):
     state_path = state_path or LAST_SERIAL_PATH
@@ -900,6 +914,7 @@ def npm_poll_loop(
                 ranked, process_npm_release,
                 workers=workers, slack=slack,
                 model=model, aws_region=aws_region,
+                max_diff_tokens=max_diff_tokens,
                 eco_label="npm", stats=stats,
             )
 
@@ -918,6 +933,7 @@ def npm_run_once(
     *,
     model: str | None = None,
     aws_region: str | None = None,
+    max_diff_tokens: int | None = None,
     workers: int = DEFAULT_WORKERS,
 ):
     """One-shot: check for npm releases published in the last *lookback_seconds*."""
@@ -962,6 +978,7 @@ def npm_run_once(
         ranked, process_npm_release,
         workers=workers, slack=slack,
         model=model, aws_region=aws_region,
+        max_diff_tokens=max_diff_tokens,
         eco_label="npm",
     )
 
@@ -980,6 +997,8 @@ def main():
     parser.add_argument("--aws-region", help="AWS region for Bedrock (default: AWS_REGION env or us-east-1)")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help=f"Concurrent analysis workers per ecosystem (default: {DEFAULT_WORKERS})")
+    parser.add_argument("--max-diff-tokens", type=int, default=None,
+                        help="Max input tokens for diff truncation (default: SCM_MAX_DIFF_TOKENS env or 900000)")
     parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging (includes Bedrock response details)")
 
     pypi_group = parser.add_argument_group("PyPI options")
@@ -1014,6 +1033,7 @@ def main():
                 since_serial=args.serial,
                 model=args.model,
                 aws_region=args.aws_region,
+                max_diff_tokens=args.max_diff_tokens,
                 workers=args.workers,
             )
         if enable_npm:
@@ -1022,6 +1042,7 @@ def main():
             npm_run_once(
                 npm_watchlist, slack=args.slack,
                 model=args.model, aws_region=args.aws_region,
+                max_diff_tokens=args.max_diff_tokens,
                 workers=args.workers,
             )
     else:
@@ -1037,6 +1058,7 @@ def main():
                     "initial_serial": args.serial,
                     "model": args.model,
                     "aws_region": args.aws_region,
+                    "max_diff_tokens": args.max_diff_tokens,
                     "workers": args.workers,
                 },
                 daemon=True,
@@ -1055,6 +1077,7 @@ def main():
                     "initial_seq": args.npm_seq,
                     "model": args.model,
                     "aws_region": args.aws_region,
+                    "max_diff_tokens": args.max_diff_tokens,
                     "workers": args.workers,
                 },
                 daemon=True,

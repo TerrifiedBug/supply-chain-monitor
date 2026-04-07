@@ -207,8 +207,8 @@ VERDICT_TOOL = {
 # Approximate chars per token for a code/text mix
 _CHARS_PER_TOKEN = 3.5
 # Bedrock has a 1M token input limit.  Reserve headroom for system prompt + tool schema.
-_MAX_INPUT_TOKENS = 900_000
-_MAX_DIFF_CHARS = int(_MAX_INPUT_TOKENS * _CHARS_PER_TOKEN)  # ~3.15M chars
+_DEFAULT_MAX_INPUT_TOKENS = int(os.environ.get("SCM_MAX_DIFF_TOKENS", "900000"))
+_MAX_DIFF_CHARS = int(_DEFAULT_MAX_INPUT_TOKENS * _CHARS_PER_TOKEN)
 
 # Auto-generated files: massive diffs, almost zero signal for supply chain attacks
 _LOW_SIGNAL_FILES = frozenset({
@@ -366,6 +366,7 @@ def analyze_diff(
     *,
     model: str | None = None,
     aws_region: str | None = None,
+    max_diff_tokens: int | None = None,
 ) -> tuple[str, str]:
     """Analyze a package diff for supply chain compromise via Bedrock.
 
@@ -376,7 +377,8 @@ def analyze_diff(
 
     # Pre-filter large diffs to stay within Bedrock's token limit
     original_len = len(diff_text)
-    diff_text, was_truncated = _prepare_diff(diff_text)
+    max_chars = int((max_diff_tokens or _DEFAULT_MAX_INPUT_TOKENS) * _CHARS_PER_TOKEN)
+    diff_text, was_truncated = _prepare_diff(diff_text, max_chars=max_chars)
     if was_truncated:
         log.warning(
             "Diff filtered/truncated to fit token budget: %d → %d chars "
@@ -490,6 +492,10 @@ def main():
         "--aws-region", default=None,
         help=f"AWS region for Bedrock (default: {DEFAULT_AWS_REGION})",
     )
+    parser.add_argument(
+        "--max-diff-tokens", type=int, default=None,
+        help="Max input tokens for diff (default: SCM_MAX_DIFF_TOKENS env or 900000)",
+    )
     parser.add_argument("--json", action="store_true", dest="json_output", help="Output as JSON")
     args = parser.parse_args()
 
@@ -507,6 +513,7 @@ def main():
     try:
         verdict, analysis = analyze_diff(
             diff_text, model=args.model, aws_region=args.aws_region,
+            max_diff_tokens=args.max_diff_tokens,
         )
     except Exception as exc:
         log.error("Analysis failed: %s", exc)
