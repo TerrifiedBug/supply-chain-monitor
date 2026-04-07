@@ -303,6 +303,35 @@ def send_slack_alert(
         log.error("Failed to send Slack alert:\n%s", traceback.format_exc())
 
 
+def send_slack_alert_degraded(
+    package: str,
+    version: str,
+    rank: int,
+    error_detail: str,
+    slack: bool = False,
+    ecosystem: str = "pypi",
+):
+    """Send a Slack alert when Bedrock analysis fails (monitor degradation)."""
+    eco_label = "npm" if ecosystem == "npm" else "PyPI"
+    body = (
+        f":warning: *Monitor Degraded: {package} {version} analysis failed*\n\n"
+        f"*Rank:* #{rank:,} of top {eco_label} packages\n"
+        f"*Error:* ```{error_detail[:2000]}```\n"
+        f"This release was NOT analyzed. Manual review may be needed."
+    )
+
+    if not slack:
+        log.warning("Slack disabled — degradation alert not sent:\n%s", body)
+        return
+
+    try:
+        s = Slack()
+        s.SendMessage(s.channel, body)
+        log.info("Slack degradation alert sent for %s %s", package, version)
+    except Exception:
+        log.error("Failed to send degradation alert:\n%s", traceback.format_exc())
+
+
 # ---------------------------------------------------------------------------
 # npm registry helpers
 # ---------------------------------------------------------------------------
@@ -543,6 +572,11 @@ def process_npm_release(
                 package, new_version, rank, verdict, analysis,
                 slack=slack, ecosystem="npm",
             )
+        elif verdict == "error":
+            send_slack_alert_degraded(
+                package, new_version, rank, analysis,
+                slack=slack, ecosystem="npm",
+            )
 
         return verdict
     finally:
@@ -683,6 +717,11 @@ def process_release(
 
         if verdict == "malicious":
             send_slack_alert(package, new_version, rank, verdict, analysis, slack=slack)
+        elif verdict == "error":
+            send_slack_alert_degraded(
+                package, new_version, rank, analysis,
+                slack=slack, ecosystem="pypi",
+            )
 
         return verdict
     finally:
